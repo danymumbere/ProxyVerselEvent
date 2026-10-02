@@ -5,54 +5,114 @@ export const config = {
 };
 
 export default async function handler(req, res) {
-  // 1. Autoriser Flutter à communiquer avec ce proxy
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
 
-  if (req.method === 'OPTIONS') {
+  if (req.method === "OPTIONS") {
     return res.status(200).end();
   }
 
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      error: "Méthode non autorisée",
+    });
+  }
+
   try {
-    // 2. Assembler les morceaux de l'image envoyée par Flutter
+    // -----------------------------
+    // 1. Vérification du token HF
+    // -----------------------------
+    const hfToken = process.env.HF_TOKEN;
+
+    if (!hfToken) {
+      return res.status(500).json({
+        error: "HF_TOKEN manquant dans les variables Vercel",
+      });
+    }
+
+    // -----------------------------
+    // 2. Lire l'image reçue
+    // -----------------------------
     const chunks = [];
+
     for await (const chunk of req) {
       chunks.push(chunk);
     }
+
     const imageBuffer = Buffer.concat(chunks);
 
-    if (imageBuffer.length === 0) {
-      throw new Error("L'image reçue par Vercel est vide.");
+    if (!imageBuffer.length) {
+      return res.status(400).json({
+        error: "Image vide reçue par Vercel",
+      });
     }
 
-    // 3. Envoyer à Hugging Face (CORRECTION ICI)
-    const hfResponse = await fetch('https://api-inference.huggingface.co/models/briaai/RMBG-1.4', {
-      method: 'POST',
+    console.log("Image reçue :", imageBuffer.length, "octets");
+
+    // -----------------------------
+    // 3. Hugging Face
+    // -----------------------------
+    // Nouveau routeur d'inférence
+    const hfUrl =
+      "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4";
+
+    console.log("Envoi vers Hugging Face...");
+
+    const hfResponse = await fetch(hfUrl, {
+      method: "POST",
       headers: {
-        'Authorization': `Bearer ${process.env.HF_TOKEN}`,
-        'Content-Type': 'application/octet-stream', // Obligatoire : indique un fichier binaire
+        Authorization: `Bearer ${hfToken}`,
+        "Content-Type": "application/octet-stream",
+        Accept: "image/png",
       },
-      // Obligatoire pour Node.js 18+ : Convertir le Buffer en format Web natif
-      body: new Uint8Array(imageBuffer), 
+      body: imageBuffer,
     });
 
+    console.log(
+      "Réponse Hugging Face :",
+      hfResponse.status,
+      hfResponse.statusText
+    );
+
+    // -----------------------------
+    // 4. Gérer les erreurs HF
+    // -----------------------------
     if (!hfResponse.ok) {
       const errorText = await hfResponse.text();
-      return res.status(hfResponse.status).send(`Erreur Hugging Face: ${errorText}`);
+
+      console.error("Erreur Hugging Face :", errorText);
+
+      return res.status(hfResponse.status).json({
+        error: "Erreur Hugging Face",
+        status: hfResponse.status,
+        details: errorText,
+      });
     }
 
-    // 4. Renvoyer l'image sans fond à Flutter
-    const resultBuffer = await hfResponse.arrayBuffer();
-    res.setHeader('Content-Type', 'image/png');
-    return res.send(Buffer.from(resultBuffer));
+    // -----------------------------
+    // 5. Récupérer le PNG
+    // -----------------------------
+    const resultBuffer = Buffer.from(
+      await hfResponse.arrayBuffer()
+    );
 
+    console.log(
+      "Image détourée reçue :",
+      resultBuffer.length,
+      "octets"
+    );
+
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store");
+
+    return res.status(200).send(resultBuffer);
   } catch (error) {
-    console.error("Crash du proxy Vercel:", error);
-    // Renvoie plus de détails s'il y a une erreur réseau sous-jacente
-    return res.status(500).json({ 
-      error: error.message, 
-      cause: error.cause ? error.cause.message : "Inconnue" 
+    console.error("Crash du proxy :", error);
+
+    return res.status(500).json({
+      error: error?.message || "Erreur inconnue",
+      cause: error?.cause?.message || null,
     });
   }
 }
