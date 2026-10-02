@@ -1,3 +1,6 @@
+import { InferenceClient } from "@huggingface/inference";
+import sharp from "sharp";
+
 export const config = {
   api: {
     bodyParser: false,
@@ -5,6 +8,9 @@ export const config = {
 };
 
 export default async function handler(req, res) {
+  // -----------------------------
+  // CORS
+  // -----------------------------
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -21,18 +27,18 @@ export default async function handler(req, res) {
 
   try {
     // -----------------------------
-    // 1. Vérification du token HF
+    // 1. Récupérer le token HF
     // -----------------------------
     const hfToken = process.env.HF_TOKEN;
 
     if (!hfToken) {
       return res.status(500).json({
-        error: "HF_TOKEN manquant dans les variables Vercel",
+        error: "HF_TOKEN absent des variables Vercel",
       });
     }
 
     // -----------------------------
-    // 2. Lire l'image reçue
+    // 2. Lire l'image envoyée
     // -----------------------------
     const chunks = [];
 
@@ -42,77 +48,177 @@ export default async function handler(req, res) {
 
     const imageBuffer = Buffer.concat(chunks);
 
-    if (!imageBuffer.length) {
+    if (!imageBuffer || imageBuffer.length === 0) {
       return res.status(400).json({
-        error: "Image vide reçue par Vercel",
+        error: "Aucune image reçue",
       });
     }
 
-    console.log("Image reçue :", imageBuffer.length, "octets");
-
-    // -----------------------------
-    // 3. Hugging Face
-    // -----------------------------
-    // Nouveau routeur d'inférence
-    const hfUrl =
-      "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4";
-
-    console.log("Envoi vers Hugging Face...");
-
-    const hfResponse = await fetch(hfUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${hfToken}`,
-        "Content-Type": "application/octet-stream",
-        Accept: "image/png",
-      },
-      body: imageBuffer,
-    });
-
     console.log(
-      "Réponse Hugging Face :",
-      hfResponse.status,
-      hfResponse.statusText
-    );
-
-    // -----------------------------
-    // 4. Gérer les erreurs HF
-    // -----------------------------
-    if (!hfResponse.ok) {
-      const errorText = await hfResponse.text();
-
-      console.error("Erreur Hugging Face :", errorText);
-
-      return res.status(hfResponse.status).json({
-        error: "Erreur Hugging Face",
-        status: hfResponse.status,
-        details: errorText,
-      });
-    }
-
-    // -----------------------------
-    // 5. Récupérer le PNG
-    // -----------------------------
-    const resultBuffer = Buffer.from(
-      await hfResponse.arrayBuffer()
-    );
-
-    console.log(
-      "Image détourée reçue :",
-      resultBuffer.length,
+      "📥 Image reçue :",
+      imageBuffer.length,
       "octets"
     );
 
+    // -----------------------------
+    // 3. Créer le client Hugging Face
+    // -----------------------------
+    const hf = new InferenceClient(hfToken);
+
+    console.log(
+      "🤖 Envoi vers Hugging Face / Fal AI..."
+    );
+
+    // -----------------------------
+    // 4. RMBG-2.0 via Fal AI
+    // -----------------------------
+    const segmentation = await hf.imageSegmentation({
+      data: imageBuffer,
+      model: "briaai/RMBG-2.0",
+      provider: "fal-ai",
+    });
+
+    console.log(
+      "✅ Réponse segmentation reçue"
+    );
+
+    if (!segmentation || segmentation.length === 0) {
+      return res.status(500).json({
+        error: "Aucun masque retourné par le modèle",
+      });
+    }
+
+    console.log(
+      "Nombre de segments :",
+      segmentation.length
+    );
+
+    // -----------------------------
+    // 5. Trouver le masque principal
+    // -----------------------------
+    let selectedSegment = segmentation[0];
+
+    for (const segment of segmentation) {
+      const label = String(segment.label || "").toLowerCase();
+
+      if (
+        label.includes("foreground") ||
+        label.includes("person") ||
+        label.includes("object")
+      ) {
+        selectedSegment = segment;
+        break;
+      }
+    }
+
+    if (!selectedSegment.mask) {
+      return res.status(500).json({
+        error: "Le modèle n'a retourné aucun masque exploitable",
+      });
+    }
+
+    // -----------------------------
+    // 6. Décoder le masque
+    // -----------------------------
+    const maskBase64 = selectedSegment.mask;
+
+    const maskBuffer = Buffer.from(
+      maskBase64,
+      "base64"
+    );
+
+    console.log(
+      "🎭 Masque reçu :",
+      maskBuffer.length,
+      "octets"
+    );
+
+    // -----------------------------
+    // 7. Mettre le masque à la taille
+    //    exacte de l'image originale
+    // -----------------------------
+    const original = sharp(imageBuffer);
+
+    const metadata = await original.metadata();
+
+    if (!metadata.width || !metadata.height) {
+      return res.status(500).json({
+        error: "Impossible de déterminer la taille de l'image",
+      });
+    }
+
+    console.log(
+      "📐 Taille image :",
+      metadata.width,
+      "x",
+      metadata.height
+    );
+
+    const resizedMask = await sharp(maskBuffer)
+      .resize(metadata.width, metadata.height)
+      .grayscale()
+      .toBuffer();
+
+    // -----------------------------
+    // 8. Convertir le masque en Alpha
+    // -----------------------------
+    const rgbaImage = await original
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const alphaMask = await sharp(resizedMask)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const pixels = rgbaImage.data;
+    const alpha = alphaMask.data;
+
+    // Appliquer le masque au canal alpha
+    for (let i = 0, a = 0; i < pixels.length; i += 4, a++) {
+      pixels[i + 3] = alpha[a];
+    }
+
+    // -----------------------------
+    // 9. Générer le PNG transparent
+    // -----------------------------
+    const outputBuffer = await sharp(pixels, {
+      raw: {
+        width: rgbaImage.info.width,
+        height: rgbaImage.info.height,
+        channels: 4,
+      },
+    })
+      .png()
+      .toBuffer();
+
+    console.log(
+      "🎉 PNG transparent généré :",
+      outputBuffer.length,
+      "octets"
+    );
+
+    // -----------------------------
+    // 10. Retour à Flutter
+    // -----------------------------
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-store");
 
-    return res.status(200).send(resultBuffer);
+    return res.status(200).send(outputBuffer);
+
   } catch (error) {
-    console.error("Crash du proxy :", error);
+    console.error(
+      "❌ ERREUR PROXY :",
+      error
+    );
 
     return res.status(500).json({
       error: error?.message || "Erreur inconnue",
       cause: error?.cause?.message || null,
+      stack:
+        process.env.NODE_ENV === "development"
+          ? error?.stack
+          : undefined,
     });
   }
 }
